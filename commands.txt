@@ -1,0 +1,310 @@
+git clone https://github.com/awslabs/graphstorm.git
+cd graphstorm
+
+BUILD_DIR=$PWD/.graphstorm-build
+mkdir -p $BUILD_DIR/code
+
+cp docker/local/fetch_and_run.sh $BUILD_DIR/code/
+cp -r python $BUILD_DIR/code/
+cp -r examples $BUILD_DIR/code/
+cp -r inference_scripts $BUILD_DIR/code/
+cp -r tools $BUILD_DIR/code/
+cp -r training_scripts $BUILD_DIR/code/
+
+podman-hpc build \
+  --build-arg DEVICE=gpu \
+  --build-arg SOURCE=docker.io/nvidia/cuda:12.1.1-runtime-ubuntu22.04 \
+  --build-arg USE_PARMETIS=false \
+  -f docker/local/Dockerfile.local \
+  -t graphstorm:local-gpu \
+  "$BUILD_DIR"
+
+podman-hpc images
+
+podman-hpc migrate graphstorm:local-gpu
+
+salloc \
+  -A YOUR_NERSC_ACCOUNT \
+  -C gpu \
+  -q interactive \
+  -N 1 \
+  --gpus-per-node=4 \
+  -t 00:30:00
+
+podman-hpc run \
+  --rm \
+  --gpu \
+  --entrypoint= \
+  graphstorm:local-gpu \
+  nvidia-smi
+
+podman-hpc run \
+  --rm \
+  --gpu \
+  --entrypoint= \
+  graphstorm:local-gpu \
+  python -c "import torch; print(torch.__version__); print(torch.cuda.device_count())"
+
+podman-hpc run \
+  --rm -it \
+  --gpu \
+  --entrypoint= \
+  -v "$PSCRATCH:/pscratch" \
+  graphstorm:local-gpu \
+  bash
+
+cd /graphstorm
+
+pip install -U pip
+pip install -U setuptools wheel
+pip install autogluon
+
+source /opt/gs-venv/bin/activate
+
+pip uninstall -y dgl torch torchvision torchaudio
+
+pip install torch==2.4.0 \
+    --index-url https://download.pytorch.org/whl/cu121
+
+pip install dgl==2.4.0 \
+    -f https://data.dgl.ai/wheels/torch-2.4/cu121/repo.html
+
+pip install "transformers==4.44.2"
+
+pip install graphstorm==0.4.2.post1
+
+apt update
+apt install nano
+pip install torchkge
+
+python - <<'PY'
+import torch
+import dgl
+import graphstorm
+
+print("PyTorch:", torch.__version__)
+print("DGL:", dgl.__version__)
+print("CUDA available:", torch.cuda.is_available())
+print("GraphStorm imported successfully")
+PY
+
+
+
+python -m pip install \
+    --force-reinstall \
+    --no-deps \
+    --extra-index-url https://pypi.nvidia.com \
+    'pylibwholegraph-cu12==23.12.0'
+    
+python - <<'PY'
+import torch
+import pylibwholegraph
+
+print("PyTorch:", torch.__version__)
+print("PyTorch CUDA:", torch.version.cuda)
+print("WholeGraph:", pylibwholegraph.__version__)
+PY
+
+
+python tools/partition_graph.py \
+    --dataset ogbn-arxiv \
+    --filepath /pscratch/graphstorm-test/ogbn-arxiv-nc \
+    --num-parts 1 \
+    --output /pscratch/graphstorm-test/ogbn_arxiv_nc_1p
+
+mkdir -p /pscratch/graphstorm-test/ogbn-arxiv-nc
+
+python -m graphstorm.run.gs_node_classification \
+    --workspace /pscratch/graphstorm-test/ogbn-arxiv-nc \
+    --num-trainers 4 \
+    --num-servers 1 \
+    --part-config /pscratch/graphstorm-test/ogbn_arxiv_nc_1p/ogbn-arxiv.json \
+    --cf /graphstorm/training_scripts/gsgnn_np/arxiv_nc.yaml \
+    --save-model-path /pscratch/graphstorm-test/ogbn-arxiv-nc/models
+
+---
+BUILD_DIR=$PWD/.graphstorm-build
+mkdir -p $BUILD_DIR/code
+cp docker/local/fetch_and_run.sh $BUILD_DIR/code/
+cp -r python examples inference_scripts tools training_scripts $BUILD_DIR/code/
+
+---
+transE
+
+prepare_fb15k.py
+
+import json
+from pathlib import Path
+
+import pandas as pd
+from torchkge.utils.datasets import load_fb15k
+
+# Load FB15k training dataset
+print("Loading FB15k...", flush=True)
+kg, _, _ = load_fb15k()
+
+print(f"Entities: {kg.n_ent}")
+print(f"Relations: {kg.n_rel}")
+print(f"Training triples: {kg.n_facts}")
+
+# Output directory
+out = Path("fb15k").resolve()
+out.mkdir(parents=True, exist_ok=True)
+
+# Save entity IDs
+pd.DataFrame({
+    "id": range(kg.n_ent)
+}).to_csv(out / "entities.csv", index=False)
+
+# Save edges, one edge type per relation
+edges = []
+
+for r in range(kg.n_rel):
+    mask = kg.relations == r
+
+    df = pd.DataFrame({
+        "src": kg.head_idx[mask].cpu().numpy(),
+        "dst": kg.tail_idx[mask].cpu().numpy(),
+    })
+
+    path = out / f"relation_{r}.csv"
+    df.to_csv(path, index=False)
+
+    edges.append({
+        "source_id_col": "src",
+        "dest_id_col": "dst",
+        "relation": ["entity", f"rel_{r}", "entity"],
+        "files": str(path),
+        "format": {
+            "name": "csv"
+        },
+        "labels": [{
+            "task_type": "link_prediction",
+            "split_pct": [1.0, 0.0, 0.0]
+        }]
+    })
+
+# GraphStorm construction config
+config = {
+    "version": "gconstruct-v0.1",
+    "nodes": [{
+        "node_type": "entity",
+        "node_id_col": "id",
+        "files": str(out / "entities.csv"),
+        "format": {
+            "name": "csv"
+        }
+    }],
+    "edges": edges
+}
+
+# Write graph configuration
+config_path = out / "graph.json"
+
+with open(config_path, "w") as f:
+    json.dump(config, f, indent=2)
+
+print("\nPreparation complete!", flush=True)
+print(f"Graph config: {config_path}")
+print(f"Entities: {kg.n_ent}")
+print(f"Relations: {kg.n_rel}")
+print(f"Edge types: {len(edges)}")
+
+
+python -u -m graphstorm.gconstruct.construct_graph \
+    --conf-file "$(realpath fb15k/graph.json)" \
+    --output-dir "$(realpath -m fb15k/partitioned)" \
+    --graph-name fb15k \
+    --num-parts 1 \
+    --num-processes 128
+
+python -u -m graphstorm.gconstruct.construct_graph \
+    --conf-file fb15k/graph.json \
+    --output-dir fb15k/partitioned \
+    --graph-name fb15k \
+    --num-parts 1 \
+    --num-processes 128
+
+
+
+transe.yaml
+
+version: 1.0
+
+gsf:
+  basic:
+    backend: nccl
+    model_encoder_type: learnable_embed
+    task_type: link_prediction
+    verbose: true
+    use_wholegraph_embed: true
+
+  gnn:
+    num_layers: 0
+    hidden_size: 1024
+
+  hyperparam:
+    lr: 0.0004
+    sparse_optimizer_lr: 0.0004
+    wd_l2norm: 1.0e-5
+    num_epochs: 1
+    batch_size: 393216
+
+  link_prediction:
+    lp_decoder_type: transe_l2
+    gamma: 12.0
+    lp_loss_func: contrastive
+    train_negative_sampler: uniform
+    num_negative_edges: 1
+    exclude_training_targets: false
+    no_validation: true
+
+mkdir -p fb15k/workspace
+
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export OMP_NUM_THREADS=4
+export PYTHONUNBUFFERED=1
+
+python -u -m graphstorm.run.gs_link_prediction \
+    --workspace "$(pwd)/fb15k/workspace" \
+    --num-trainers 4 \
+    --num-servers 1 \
+    --num-samplers 0 \
+    --part-config "$(pwd)/fb15k/partitioned/fb15k.json" \
+    --cf "$(pwd)/transe.yaml" \
+    --save-model-path "$(pwd)/fb15k/models" \
+    2>&1 | tee fb15k/train.log
+
+export OMP_NUM_THREADS=128
+export MKL_NUM_THREADS=128
+export PYTHONUNBUFFERED=1
+
+python -u -m graphstorm.gconstruct.construct_graph \
+    --conf-file fb15k/graph.json \
+    --output-dir fb15k/partitioned \
+    --graph-name fb15k \
+    --num-parts 1 \
+    --num-processes 1 \
+    2>&1 | tee construct.log
+
+
+---
+
+
+
+python -m pip install \
+    --force-reinstall \
+    --no-deps \
+    --extra-index-url https://pypi.nvidia.com \
+    'pylibwholegraph-cu12==23.12.0'
+    
+python - <<'PY'
+import torch
+import pylibwholegraph
+
+print("PyTorch:", torch.__version__)
+print("PyTorch CUDA:", torch.version.cuda)
+print("WholeGraph:", pylibwholegraph.__version__)
+PY
+
+python -m pip check
